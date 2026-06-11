@@ -1,10 +1,11 @@
-# recycle_all_in_one_complete_v9.py
+# recycle_all_in_one_complete_v10.py
 # ------------------------------------------------------------
-# 재활용 쓰레기 분류 + 오염도 판정 올인원 버전 v9
+# 재활용 쓰레기 분류 + 오염도 판정 올인원 버전 v10
 # 개선 사항:
-#   1. 이미지 업로드 결과 유지: st.session_state를 사용하여 버튼 클릭 후 결과가 사라지지 않도록 수정
-#   2. 배포 최적화: Streamlit Community Cloud 등 클라우드 환경에서 안정적으로 작동하도록 경로 및 설정 조정
-#   3. 분석 영역 시각화 및 분석 버튼 기능 강화
+#   1. 물체 감지 정확도 향상: 배경(전등)이나 손가락을 피하고 중앙 물체에 집중하도록 로직 강화
+#   2. 한글 깨짐 해결: PIL을 사용하여 결과 화면에 한글 라벨이 정상적으로 표시되도록 수정
+#   3. 분석 영역 시각화 개선: 박스 가독성 및 포커스 효과 강화
+#   4. 상태 유지 로직 최적화: Streamlit 세션 상태를 통한 안정적인 결과 출력
 # ------------------------------------------------------------
 
 import argparse
@@ -25,32 +26,37 @@ from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
-# 기본 설정
+# 패키지 및 환경 설정
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
-
-def get_work_dir() -> Path:
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        return Path(local_appdata) / "RecycleClassifier" / "auto_train_output"
-    return BASE_DIR / "auto_train_output"
-
-WORK_DIR = get_work_dir()
-FEEDBACK_DIR = BASE_DIR / "feedback_samples"
-
 MATERIAL_MODEL_PATH = MODELS_DIR / "material_cls.pt"
 CONTAMINATION_MODEL_PATH = MODELS_DIR / "contamination_cls.pt"
-TRAIN_INFO_PATH = MODELS_DIR / "train_info.json"
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+REQUIRED_PACKAGES = [
+    ("cv2", "opencv-python-headless"),
+    ("numpy", "numpy"),
+    ("PIL", "pillow"),
+    ("streamlit", "streamlit"),
+    ("ultralytics", "ultralytics"),
+]
 
-MATERIAL_MAP = {
-    "유리": "glass", "종이": "paper", "캔": "can",
-    "비닐": "vinyl", "스티로폼": "styrofoam",
-    "플라스틱": "plastic", "페트": "plastic",
-}
+def ensure_packages():
+    for module_name, package_name in REQUIRED_PACKAGES:
+        if importlib.util.find_spec(module_name) is None:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+
+ensure_packages()
+
+import cv2
+import numpy as np
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
+
+# ============================================================
+# 상수 및 데이터
+# ============================================================
 
 MATERIAL_LABELS_KOR = {
     "glass": "유리", "paper": "종이", "can": "캔",
@@ -63,107 +69,118 @@ CONTAMINATION_LABELS_KOR = {
 }
 
 RECYCLE_EXCHANGE_INFO = {
-    "paper": {
-        "title": "📄 종이류 / 종이팩 교환",
-        "content": "우유팩, 두유팩 등 종이팩을 깨끗이 씻어 말려 거주지 주민센터로 가져가시면 **화장지** 또는 **종량제 봉투**로 교환해 드립니다.",
-        "tip": "일반 폐지와 종이팩은 분리해서 배출해야 재활용률이 높습니다!"
-    },
-    "can": {
-        "title": "🥫 캔류 / 폐건전지 교환",
-        "content": "다 쓴 건전지를 주민센터나 일부 대형마트의 수거함에 가져가시면 **새 건전지**로 교환해 주는 사업이 활발합니다.",
-        "tip": "캔은 내용물을 비우고 압착하여 배출하면 부피를 줄일 수 있습니다."
-    },
-    "plastic": {
-        "title": "🧴 투명 페트병 보상",
-        "content": "일부 지자체에서는 '순환자원 회수로봇(네프론 등)'을 운영합니다. 투명 페트병을 넣으면 **현금 포인트**를 적립해 드립니다.",
-        "tip": "라벨을 반드시 제거하고 압착해서 넣어주세요!"
-    },
-    "glass": {
-        "title": "🍾 빈 병 보증금 반환",
-        "content": "소주병, 맥주병 등 '보증금 환불 문구'가 있는 병은 편의점이나 대형마트에 반납하고 **보증금**을 돌려받을 수 있습니다.",
-        "tip": "이물질이 들어간 병은 반환이 거부될 수 있습니다."
-    },
-    "vinyl": {
-        "title": "🛍️ 비닐류 배출",
-        "content": "깨끗하게 모은 비닐은 고형연료 등으로 재활용됩니다. 오염된 비닐은 종량제 봉투에 버려주세요.",
-        "tip": "색상에 상관없이 깨끗한 비닐은 모두 재활용 대상입니다."
-    },
-    "styrofoam": {
-        "title": "📦 스티로폼 배출",
-        "content": "흰색 스티로폼은 테이프와 운송장을 완전히 제거한 후 깨끗한 상태로 배출해 주세요.",
-        "tip": "코팅되거나 색깔이 있는 스티로폼은 재활용이 어렵습니다."
-    }
+    "paper": {"title": "📄 종이류 / 종이팩 교환", "content": "우유팩 등을 깨끗이 씻어 주민센터로 가져가시면 화장지나 종량제 봉투로 교환해 드립니다."},
+    "can": {"title": "🥫 캔류 / 폐건전지 교환", "content": "다 쓴 건전지를 주민센터 수거함에 가져가시면 새 건전지로 교환해 줍니다."},
+    "plastic": {"title": "🧴 투명 페트병 보상", "content": "순환자원 회수로봇(네프론 등)에 투명 페트병을 넣으면 포인트를 적립해 드립니다."},
+    "glass": {"title": "🍾 빈 병 보증금 반환", "content": "보증금 문구가 있는 병은 마트/편의점에서 보증금을 돌려받을 수 있습니다."},
+    "vinyl": {"title": "🛍️ 비닐류 배출", "content": "깨끗한 비닐은 분리 배출하면 고형연료 등으로 재활용됩니다."},
+    "styrofoam": {"title": "📦 스티로폼 배출", "content": "흰색 스티로폼은 테이프 제거 후 깨끗하게 배출해 주세요."},
 }
 
-REQUIRED_PACKAGES = [
-    ("cv2", "opencv-python-headless"), # 서버 배포용은 headless 권장
-    ("numpy", "numpy"),
-    ("pandas", "pandas"),
-    ("PIL", "pillow"),
-    ("streamlit", "streamlit"),
-    ("ultralytics", "ultralytics"),
-]
+# ============================================================
+# 분석 영역 감지 로직 (개선됨)
+# ============================================================
 
-def ensure_packages() -> None:
-    for module_name, package_name in REQUIRED_PACKAGES:
-        if importlib.util.find_spec(module_name) is None:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+def get_refined_bbox(image_bgr: np.ndarray) -> Tuple[int, int, int, int]:
+    """배경 노이즈를 피하고 실제 물체가 있을 법한 중앙 영역을 정밀하게 추출합니다."""
+    h, w = image_bgr.shape[:2]
+    
+    # 1. 이미지 중앙부만 집중 (가장자리 전등 등 노이즈 제거)
+    center_y, center_x = h // 2, w // 2
+    roi_h, roi_w = int(h * 0.7), int(w * 0.7)
+    y1_roi, x1_roi = max(0, center_y - roi_h // 2), max(0, center_x - roi_w // 2)
+    roi = image_bgr[y1_roi:y1_roi+roi_h, x1_roi:x1_roi+roi_w]
+    
+    # 2. ROI 내에서 물체 찾기
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    
+    # 적응형 임계값 처리를 통해 조명 영향 최소화
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # 컨투어 찾기
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        # 중앙과 가장 가까운 큰 컨투어 찾기
+        best_cnt = None
+        min_dist = float('inf')
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < (roi_h * roi_w * 0.05): continue # 너무 작은 건 무시
+            
+            M = cv2.moments(cnt)
+            if M["m00"] == 0: continue
+            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+            dist = ((cx - roi_w//2)**2 + (cy - roi_h//2)**2)**0.5
+            
+            if dist < min_dist:
+                min_dist = dist
+                best_cnt = cnt
+        
+        if best_cnt is not None:
+            x, y, bw, bh = cv2.boundingRect(best_cnt)
+            # 전체 이미지 좌표로 변환
+            pad = 20
+            return (max(0, x + x1_roi - pad), max(0, y + y1_roi - pad), 
+                    min(w, x + x1_roi + bw + pad), min(h, y + y1_roi + bh + pad))
 
-ensure_packages()
+    # 물체를 못 찾으면 기본 중앙 영역 반환
+    m = 0.2
+    return int(w*m), int(h*m), int(w*(1-m)), int(h*(1-m))
 
-import cv2
-import numpy as np
-import pandas as pd
-import streamlit as st
-from PIL import Image
+# ============================================================
+# 시각화 로직 (한글 지원)
+# ============================================================
+
+def draw_info_pil(image_bgr: np.ndarray, bbox: Tuple[int, int, int, int], label: str) -> np.ndarray:
+    """PIL을 사용하여 한글이 포함된 분석 결과를 이미지에 그립니다."""
+    img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    draw = ImageDraw.Draw(pil_img, "RGBA")
+    
+    x1, y1, x2, y2 = bbox
+    
+    # 1. 배경 어둡게 처리 (박스 외 영역)
+    overlay = Image.new("RGBA", pil_img.size, (0, 0, 0, 0))
+    draw_ov = ImageDraw.Draw(overlay)
+    draw_ov.rectangle([0, 0, pil_img.width, pil_img.height], fill=(0, 0, 0, 100))
+    draw_ov.rectangle([x1, y1, x2, y2], fill=(0, 0, 0, 0)) # 박스 영역은 투명하게
+    pil_img.paste(Image.alpha_composite(pil_img.convert("RGBA"), overlay).convert("RGB"))
+    
+    # 2. 박스 그리기
+    draw = ImageDraw.Draw(pil_img)
+    draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=5)
+    
+    # 3. 한글 텍스트 쓰기
+    try:
+        # 나눔고딕 등 시스템 폰트 시도, 없으면 기본 폰트
+        font_paths = ["/usr/share/fonts/truetype/nanum/NanumGothic.ttf", "arial.ttf"]
+        font = None
+        for p in font_paths:
+            if os.path.exists(p):
+                font = ImageFont.truetype(p, 25)
+                break
+        if font is None: font = ImageFont.load_default()
+    except:
+        font = ImageFont.load_default()
+        
+    text = f"분석 대상: {label}"
+    # 텍스트 배경
+    tw, th = draw.textbbox((0, 0), text, font=font)[2:]
+    draw.rectangle([x1, y1 - th - 10, x1 + tw + 10, y1], fill=(0, 255, 0))
+    draw.text((x1 + 5, y1 - th - 5), text, font=font, fill=(0, 0, 0))
+    
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+# ============================================================
+# Streamlit 앱 메인
+# ============================================================
+
 try:
     from ultralytics import YOLO
-except Exception:
+except:
     YOLO = None
-
-# ============================================================
-# 이미지 분석 및 시각화 로직
-# ============================================================
-
-def find_object_bbox(image_bgr: np.ndarray) -> Tuple[int, int, int, int]:
-    h, w = image_bgr.shape[:2]
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 30, 150)
-    kernel = np.ones((5, 5), np.uint8)
-    dilated = cv2.dilate(edged, kernel, iterations=2)
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        margin = 0.1
-        return int(w * margin), int(h * margin), int(w * (1 - margin)), int(h * (1 - margin))
-    
-    c = max(contours, key=cv2.contourArea)
-    x, y, bw, bh = cv2.boundingRect(c)
-    if bw * bh < (w * h * 0.01):
-        margin = 0.1
-        return int(w * margin), int(h * margin), int(w * (1 - margin)), int(h * (1 - margin))
-        
-    pad = int(max(bw, bh) * 0.1)
-    return max(0, x - pad), max(0, y - pad), min(w, x + bw + pad), min(h, y + bh + pad)
-
-def draw_analysis_box(image_bgr: np.ndarray, bbox: Tuple[int, int, int, int], label: str) -> np.ndarray:
-    out = image_bgr.copy()
-    x1, y1, x2, y2 = bbox
-    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
-    mask = np.zeros_like(out)
-    cv2.rectangle(mask, (x1, y1), (x2, y2), (255, 255, 255), -1)
-    out_overlay = cv2.addWeighted(out, 0.7, np.zeros_like(out), 0.3, 0)
-    out = np.where(mask == 255, out, out_overlay)
-    text = f"Analyzing: {label}"
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-    cv2.rectangle(out, (x1, y1 - th - 15), (x1 + tw + 10, y1), (0, 255, 0), -1)
-    cv2.putText(out, text, (x1 + 5, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-    return out
-
-# ============================================================
-# 예측 및 Streamlit UI
-# ============================================================
 
 def predict(model, img_bgr):
     if model is None: return "unknown", 0.0
@@ -171,18 +188,14 @@ def predict(model, img_bgr):
     if not results or not results[0].probs: return "unknown", 0.0
     idx = int(results[0].probs.top1)
     conf = float(results[0].probs.top1conf)
-    label = results[0].names[idx]
-    return label, conf
+    return results[0].names[idx], conf
 
 def main():
-    st.set_page_config(page_title="스마트 재활용 분류기 v9", layout="wide")
-    st.title("♻️ 스마트 재활용 분류기")
-    
-    # 상태 유지를 위한 session_state 초기화
-    if "analysis_result" not in st.session_state:
-        st.session_state.analysis_result = None
-    if "last_uploaded" not in st.session_state:
-        st.session_state.last_uploaded = None
+    st.set_page_config(page_title="스마트 재활용 분류기 v10", layout="wide")
+    st.title("♻️ 스마트 재활용 분류기 v10")
+    st.info("💡 중앙에 물체를 크게 위치시키면 더 정확하게 분석됩니다.")
+
+    if "result" not in st.session_state: st.session_state.result = None
 
     @st.cache_resource
     def load_models():
@@ -197,82 +210,62 @@ def main():
     with col1:
         tab1, tab2 = st.tabs(["📁 이미지 업로드", "📷 카메라 촬영"])
         img_input = None
-        
         with tab1:
-            uploaded = st.file_uploader("재활용품 이미지를 선택하세요", type=["jpg", "jpeg", "png", "webp"])
+            uploaded = st.file_uploader("이미지 선택", type=["jpg", "png", "jpeg"])
             if uploaded:
                 img_input = Image.open(uploaded)
-                st.image(img_input, caption="업로드된 이미지", use_container_width=True)
-                
-                # 새 이미지가 업로드되면 이전 결과 초기화
-                if st.session_state.last_uploaded != uploaded.name:
-                    st.session_state.analysis_result = None
-                    st.session_state.last_uploaded = uploaded.name
-                
-                if st.button("🔍 분석하기", key="btn_upload"):
-                    # 분석 실행 및 결과 저장
-                    with st.spinner("이미지를 분석 중입니다..."):
-                        img_np = np.array(img_input)
-                        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                        bbox = find_object_bbox(img_bgr)
-                        x1, y1, x2, y2 = bbox
-                        crop = img_bgr[y1:y2, x1:x2]
-                        m_label, m_conf = predict(m_model, crop if crop.size > 0 else img_bgr)
-                        c_label, c_conf = predict(c_model, crop if crop.size > 0 else img_bgr)
-                        
-                        st.session_state.analysis_result = {
-                            "m_label": m_label, "m_conf": m_conf,
-                            "c_label": c_label, "c_conf": c_conf,
-                            "bbox": bbox, "img_bgr": img_bgr
-                        }
-                    
+                st.image(img_input, use_container_width=True)
+                if st.button("🔍 분석 시작", key="up_btn"):
+                    st.session_state.btn_trigger = True
         with tab2:
-            camera = st.camera_input("카메라로 재활용품을 촬영하세요")
+            camera = st.camera_input("물체를 중앙에 맞추고 촬영하세요")
             if camera:
                 img_input = Image.open(camera)
-                if st.button("🔍 분석하기", key="btn_camera"):
-                    with st.spinner("분석 중..."):
-                        img_np = np.array(img_input)
-                        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                        bbox = find_object_bbox(img_bgr)
-                        x1, y1, x2, y2 = bbox
-                        crop = img_bgr[y1:y2, x1:x2]
-                        m_label, m_conf = predict(m_model, crop if crop.size > 0 else img_bgr)
-                        c_label, c_conf = predict(c_model, crop if crop.size > 0 else img_bgr)
-                        st.session_state.analysis_result = {
-                            "m_label": m_label, "m_conf": m_conf,
-                            "c_label": c_label, "c_conf": c_conf,
-                            "bbox": bbox, "img_bgr": img_bgr
-                        }
+                if st.button("🔍 분석 시작", key="cam_btn"):
+                    st.session_state.btn_trigger = True
 
-    # 결과 출력 (session_state에 결과가 있을 때만)
-    if st.session_state.analysis_result:
-        res = st.session_state.analysis_result
+    if img_input and st.session_state.get("btn_trigger"):
+        with st.spinner("정밀 분석 중..."):
+            img_np = np.array(img_input)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            
+            bbox = get_refined_bbox(img_bgr)
+            x1, y1, x2, y2 = bbox
+            crop = img_bgr[y1:y2, x1:x2]
+            
+            m_label, m_conf = predict(m_model, crop if crop.size > 0 else img_bgr)
+            c_label, c_conf = predict(c_model, crop if crop.size > 0 else img_bgr)
+            
+            st.session_state.result = {
+                "m_label": m_label, "m_conf": m_conf,
+                "c_label": c_label, "c_conf": c_conf,
+                "bbox": bbox, "img_bgr": img_bgr
+            }
+            st.session_state.btn_trigger = False
+
+    if st.session_state.result:
+        res = st.session_state.result
         with col2:
-            st.subheader("🔍 판정 결과")
-            res_m_kor = MATERIAL_LABELS_KOR.get(res["m_label"], res["m_label"])
-            res_c_kor = CONTAMINATION_LABELS_KOR.get(res["c_label"], res["c_label"])
+            st.subheader("📊 분석 결과")
+            m_kor = MATERIAL_LABELS_KOR.get(res["m_label"], res["m_label"])
+            c_kor = CONTAMINATION_LABELS_KOR.get(res["c_label"], res["c_label"])
             
-            m_col, c_col = st.columns(2)
-            m_col.metric("품목", res_m_kor, f"{res['m_conf']*100:.1f}%")
-            c_col.metric("상태", res_c_kor, f"{res['c_conf']*100:.1f}%")
+            c1, c2 = st.columns(2)
+            c1.metric("품목", m_kor, f"{res['m_conf']*100:.1f}%")
+            c2.metric("상태", c_kor, f"{res['c_conf']*100:.1f}%")
             
-            if res["c_label"] == "dirty":
-                st.warning(f"⚠️ **{res_m_kor}**이(가) 오염되었습니다. 세척 후 배출해 주세요.")
-            else:
-                st.success(f"✅ 깨끗한 **{res_m_kor}**입니다. 바로 재활용이 가능합니다.")
-
+            if res["c_label"] == "dirty": st.warning(f"⚠️ **{m_kor}**이(가) 오염되었습니다. 세척해 주세요.")
+            else: st.success(f"✅ 깨끗한 **{m_kor}**입니다.")
+            
+            viz = draw_info_pil(res["img_bgr"], res["bbox"], m_kor)
+            st.image(cv2.cvtColor(viz, cv2.COLOR_BGR2RGB), caption="분석 영역 확인", use_container_width=True)
+            
             info = RECYCLE_EXCHANGE_INFO.get(res["m_label"])
             if info:
-                with st.expander(f"💡 {info['title']} 정보 확인", expanded=True):
+                with st.expander("💡 분리배출 꿀팁", expanded=True):
+                    st.write(f"**{info['title']}**")
                     st.write(info['content'])
-                    st.info(f"**Tip:** {info['tip']}")
-            
-            viz_img = draw_analysis_box(res["img_bgr"], res["bbox"], res_m_kor)
-            st.image(cv2.cvtColor(viz_img, cv2.COLOR_BGR2RGB), caption="분석 결과 시각화", use_container_width=True)
 
 if __name__ == "__main__":
-    if "streamlit" in sys.modules and st.runtime.exists():
-        main()
-    else:
-        subprocess.run(["streamlit", "run", __file__])
+    main()
+학습시간 단축 및 이미지 업로드 기능 개선 방법? - Manus
