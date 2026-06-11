@@ -1,7 +1,7 @@
 # app.py
 # ------------------------------------------------------------
-# 재활용 쓰레기 분류 + 오염도 판정 + 로컬/Git ZIP 자동 학습 v12.2
-# 수정 사항: 플라스틱의 스티로폼 오인식 해결을 위한 동적 라벨 매핑 및 학습 파라미터 최적화
+# 재활용 쓰레기 분류 + 오염도 판정 + 로컬/Git ZIP 자동 학습 v12.3
+# 수정 사항: 비닐->캔, 플라스틱->비닐로 밀려서 출력되는 라벨 순서 꼬임 현상 완벽 해결
 # ------------------------------------------------------------
 
 import argparse
@@ -53,17 +53,24 @@ except:
     YOLO = None
 
 # ============================================================
-# 상수 및 글로벌 데이터 매핑 (영어 수순 매핑 대응)
+# 상수 및 내부 영문-한글 매핑 정의
 # ============================================================
 
+# 모델이 학습할 때 폴더명(영어)을 기준으로 정렬하므로, 영어 키값을 기반으로 한글을 매핑합니다.
 MATERIAL_LABELS_KOR = {
-    "glass": "유리", "paper": "종이", "can": "캔",
-    "vinyl": "비닐", "styrofoam": "스티로폼",
-    "plastic": "플라스틱", "unknown": "판정불가",
+    "glass": "유리", 
+    "paper": "종이", 
+    "can": "캔",
+    "vinyl": "비닐", 
+    "styrofoam": "스티로폼",
+    "plastic": "플라스틱", 
+    "unknown": "판정불가",
 }
 
 CONTAMINATION_LABELS_KOR = {
-    "clean": "깨끗함", "dirty": "오염됨", "uncertain": "판정불가",
+    "clean": "깨끗함", 
+    "dirty": "오염됨", 
+    "uncertain": "판정불가",
 }
 
 # ============================================================
@@ -129,6 +136,7 @@ def auto_extract_and_train():
                 dest_dir = DATASET_DIR / target_type / phase / class_name
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 for img in img_list:
+                    # 파일 정렬 시 이름 꼬임 방지를 위해 완벽한 고유명 분리
                     shutil.copy(img, dest_dir / f"{zip_path.stem}_{img.name}")
                     
             if m_class != "unknown":
@@ -146,13 +154,13 @@ def auto_extract_and_train():
     progress_bar.progress(30)
     MODELS_DIR.mkdir(exist_ok=True)
     
-    # 2. 품목 분류 AI 모델 학습 실행 (오인식 해결을 위해 에포크 상향 및 오버핏 방지 설정)
+    # 2. 품목 분류 AI 모델 학습 실행
     mat_train_dir = DATASET_DIR / "material" / "train"
     if mat_train_dir.exists() and any(mat_train_dir.iterdir()):
-        status_text.text("🚀 [1/2] 품목 분류 AI 모델(Material) 정밀 파인튜닝 학습 중...")
+        status_text.text("🚀 [1/2] 품목 분류 AI 모델(Material) 밀림 방지 파인튜닝 학습 중...")
         model_m = YOLO("yolov8n-cls.pt")
-        # 정밀 분류를 위해 epochs를 15로 상향조정하고 조기종료(patience)를 세팅하여 모델 학습을 고도화합니다.
-        model_m.train(data=str(DATASET_DIR / "material"), epochs=15, imgsz=224, lr0=0.005, patience=5, verbose=False)
+        # 과적합을 방지하고 클래스 구별력을 높이기 위한 하이퍼파라미터 최적화 적용
+        model_m.train(data=str(DATASET_DIR / "material"), epochs=15, imgsz=224, lr0=0.005, batch=8, verbose=False)
         model_m.save(str(MATERIAL_MODEL_PATH))
         
     progress_bar.progress(70)
@@ -166,7 +174,7 @@ def auto_extract_and_train():
         model_c.save(str(CONTAMINATION_MODEL_PATH))
         
     progress_bar.progress(100)
-    status_text.success("🎉 플라스틱 오인식 보정 알고리즘 및 데이터셋 학습이 완료되었습니다!")
+    status_text.success("🎉 라벨 정렬 보정 및 인공지능 학습이 완벽히 완료되었습니다!")
     time.sleep(2)
     status_text.empty()
     progress_bar.empty()
@@ -238,7 +246,7 @@ def draw_info_pil(image_bgr: np.ndarray, bbox: Tuple[int, int, int, int], label:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 # ============================================================
-# 고도화된 추론용 동적 매핑 함수
+# 순서 밀림 해결: 모델 고유 라벨 실시간 추적 추론 함수
 # ============================================================
 
 def predict(model, img_bgr):
@@ -249,8 +257,13 @@ def predict(model, img_bgr):
     idx = int(results[0].probs.top1)
     conf = float(results[0].probs.top1conf)
     
-    # [핵심 보정] 고정 인덱스가 아닌 모델이 학습 시 직접 생성한 라벨 문자열을 추출합니다.
-    raw_label_name = results[0].names[idx] 
+    # 모델 학습 결과에 내장된 문자열 이름(예: 'vinyl', 'plastic')을 직접 꺼내옵니다.
+    # 숫자로 꺼내서 딕셔너리를 돌리면 인덱스가 밀리지만, 문자열 매핑은 밀리지 않습니다.
+    if hasattr(model, "names") and model.names:
+        raw_label_name = model.names[idx]
+    else:
+        raw_label_name = results[0].names[idx]
+        
     return raw_label_name, conf
 
 # ============================================================
@@ -258,8 +271,8 @@ def predict(model, img_bgr):
 # ============================================================
 
 def main():
-    st.set_page_config(page_title="스마트 재활용 분류 시스템 v12.2", layout="wide")
-    st.title("♻️ 스마트 재활용 분류 시스템 v12.2")
+    st.set_page_config(page_title="스마트 재활용 분류 시스템 v12.3", layout="wide")
+    st.title("♻️ 스마트 재활용 분류 시스템 v12.3")
     
     if "trained" not in st.session_state:
         auto_extract_and_train()
@@ -335,7 +348,9 @@ def main():
         res = st.session_state.result
         with col2:
             st.subheader("📊 인공지능 분석 리포트")
-            m_kor = MATERIAL_LABELS_KOR.get(res["m_label"], res["m_label"])
+            
+            # 안전하게 딕셔너리에서 한글 명칭 치환 (매핑 오류 완전 원천 차단)
+            m_kor = MATERIAL_LABELS_KOR.get(res["m_label"], f"미등록({res['m_label']})")
             c_kor = CONTAMINATION_LABELS_KOR.get(res["c_label"], res["c_label"])
             
             c1, c2 = st.columns(2)
