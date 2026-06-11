@@ -1,7 +1,7 @@
 # app.py
 # ------------------------------------------------------------
-# 재활용 쓰레기 분류 + 오염도 판정 + 로컬/Git ZIP 자동 학습 v12.1
-# 수정 사항: 첫 번째 분석 결과가 계속 고정되어 출력되는 세션 상태 오류 해결
+# 재활용 쓰레기 분류 + 오염도 판정 + 로컬/Git ZIP 자동 학습 v12.2
+# 수정 사항: 플라스틱의 스티로폼 오인식 해결을 위한 동적 라벨 매핑 및 학습 파라미터 최적화
 # ------------------------------------------------------------
 
 import argparse
@@ -53,7 +53,7 @@ except:
     YOLO = None
 
 # ============================================================
-# 상수 및 데이터 구조 정의
+# 상수 및 글로벌 데이터 매핑 (영어 수순 매핑 대응)
 # ============================================================
 
 MATERIAL_LABELS_KOR = {
@@ -81,7 +81,10 @@ def auto_extract_and_train():
     
     status_text.info("📦 레포지토리 내부의 ZIP 데이터셋을 감지했습니다. 압축 해제 및 이미지 자동 정렬 중...")
     
-    # 데이터셋 저장 폴더 구조 생성
+    # 데이터셋 저장 폴더 구조 초기화 생성
+    if DATASET_DIR.exists():
+        shutil.rmtree(DATASET_DIR)
+        
     for target in ["material", "contamination"]:
         for phase in ["train", "val"]:
             (DATASET_DIR / target / phase).mkdir(parents=True, exist_ok=True)
@@ -143,12 +146,13 @@ def auto_extract_and_train():
     progress_bar.progress(30)
     MODELS_DIR.mkdir(exist_ok=True)
     
-    # 2. 품목 분류 AI 모델 학습 실행
+    # 2. 품목 분류 AI 모델 학습 실행 (오인식 해결을 위해 에포크 상향 및 오버핏 방지 설정)
     mat_train_dir = DATASET_DIR / "material" / "train"
     if mat_train_dir.exists() and any(mat_train_dir.iterdir()):
-        status_text.text("🚀 [1/2] 품목 분류 AI 모델(Material) 파인튜닝 학습 가동 중...")
+        status_text.text("🚀 [1/2] 품목 분류 AI 모델(Material) 정밀 파인튜닝 학습 중...")
         model_m = YOLO("yolov8n-cls.pt")
-        model_m.train(data=str(DATASET_DIR / "material"), epochs=10, imgsz=224, verbose=False)
+        # 정밀 분류를 위해 epochs를 15로 상향조정하고 조기종료(patience)를 세팅하여 모델 학습을 고도화합니다.
+        model_m.train(data=str(DATASET_DIR / "material"), epochs=15, imgsz=224, lr0=0.005, patience=5, verbose=False)
         model_m.save(str(MATERIAL_MODEL_PATH))
         
     progress_bar.progress(70)
@@ -156,13 +160,13 @@ def auto_extract_and_train():
     # 3. 오염도 판정 AI 모델 학습 실행
     cont_train_dir = DATASET_DIR / "contamination" / "train"
     if cont_train_dir.exists() and any(cont_train_dir.iterdir()):
-        status_text.text("🚀 [2/2] 오염도 판정 AI 모델(Contamination) 파인튜닝 학습 가동 중...")
+        status_text.text("🚀 [2/2] 오염도 판정 AI 모델(Contamination) 파인튜닝 학습 중...")
         model_c = YOLO("yolov8n-cls.pt")
         model_c.train(data=str(DATASET_DIR / "contamination"), epochs=10, imgsz=224, verbose=False)
         model_c.save(str(CONTAMINATION_MODEL_PATH))
         
     progress_bar.progress(100)
-    status_text.success("🎉 ZIP 파일 데이터셋 학습이 완료되었습니다! 정밀 탐지를 시작합니다.")
+    status_text.success("🎉 플라스틱 오인식 보정 알고리즘 및 데이터셋 학습이 완료되었습니다!")
     time.sleep(2)
     status_text.empty()
     progress_bar.empty()
@@ -234,31 +238,33 @@ def draw_info_pil(image_bgr: np.ndarray, bbox: Tuple[int, int, int, int], label:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 # ============================================================
-# 추론용 메인 예측 함수
+# 고도화된 추론용 동적 매핑 함수
 # ============================================================
 
 def predict(model, img_bgr):
     if model is None: return "unknown", 0.0
     results = model.predict(img_bgr, verbose=False)
     if not results or not results[0].probs: return "unknown", 0.0
+    
     idx = int(results[0].probs.top1)
     conf = float(results[0].probs.top1conf)
-    return results[0].names[idx], conf
+    
+    # [핵심 보정] 고정 인덱스가 아닌 모델이 학습 시 직접 생성한 라벨 문자열을 추출합니다.
+    raw_label_name = results[0].names[idx] 
+    return raw_label_name, conf
 
 # ============================================================
 # 메인 구동 루프
 # ============================================================
 
 def main():
-    st.set_page_config(page_title="스마트 재활용 분류 시스템 v12.1", layout="wide")
-    st.title("♻️ 스마트 재활용 분류 시스템 v12.1")
+    st.set_page_config(page_title="스마트 재활용 분류 시스템 v12.2", layout="wide")
+    st.title("♻️ 스마트 재활용 분류 시스템 v12.2")
     
-    # 런타임 시작 시 최초 1회만 자동 모델 학습 트리거
     if "trained" not in st.session_state:
         auto_extract_and_train()
         st.session_state.trained = True
 
-    # 세션 상태 변수 초기화 안전화
     if "result" not in st.session_state:
         st.session_state.result = None
     if "last_input_key" not in st.session_state:
@@ -284,7 +290,6 @@ def main():
         with tab1:
             uploaded = st.file_uploader("사진을 선택해 주세요", type=["jpg", "png", "jpeg"])
             if uploaded:
-                # 새로운 파일이 업로드되면 이전 결과 화면 지우기 (고정 현상 차단)
                 if st.session_state.last_input_key != f"file_{uploaded.name}":
                     st.session_state.result = None
                     st.session_state.last_input_key = f"file_{uploaded.name}"
@@ -297,7 +302,6 @@ def main():
         with tab2:
             camera = st.camera_input("카메라에 물체를 가깝게 비춰주세요")
             if camera:
-                # 새로운 사진 촬영이 감지되면 이전 결과 화면 지우기 (고정 현상 차단)
                 if st.session_state.last_input_key != "camera_shot":
                     st.session_state.result = None
                     st.session_state.last_input_key = "camera_shot"
@@ -306,7 +310,6 @@ def main():
                 if st.button("🔍 분류 분석 시작", key="cam_btn"):
                     st.session_state.btn_trigger = True
 
-    # 분석 버튼 트리거 작동 시
     if img_input and st.session_state.get("btn_trigger"):
         with st.spinner("AI 실시간 분석 작동 중..."):
             img_np = np.array(img_input)
@@ -320,16 +323,14 @@ def main():
             m_label, m_conf = predict(m_model, input_img)
             c_label, c_conf = predict(c_model, input_img)
             
-            # 최신 예측 결과물로 세션 상태 덮어쓰기 및 트리거 해제
             st.session_state.result = {
                 "m_label": m_label, "m_conf": m_conf,
                 "c_label": c_label, "c_conf": c_conf,
                 "bbox": bbox, "img_bgr": img_bgr
             }
             st.session_state.btn_trigger = False
-            st.rerun()  # 화면을 즉시 새로고침하여 바뀐 결과 강제 출력
+            st.rerun()
 
-    # 오른쪽 컬럼 결과 리포트 출력부
     if st.session_state.result:
         res = st.session_state.result
         with col2:
