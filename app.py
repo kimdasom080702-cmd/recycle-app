@@ -268,4 +268,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-학습시간 단축 및 이미지 업로드 기능 개선 방법? - Manus
