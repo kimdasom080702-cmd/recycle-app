@@ -1,10 +1,6 @@
 # app.py
 # ------------------------------------------------------------
 # 재활용 쓰레기 분류 + 오염도 판정 + 로컬/Git ZIP 자동 학습 v12
-# 개선 사항:
-#   1. 자동 데이터셋 빌드: 실행 시 주변의 모든 ZIP 파일을 찾아 압축 해제 후 품목/오염도 데이터셋으로 분류
-#   2. 자동 AI 파인튜닝: 압축 해제된 누끼(배경 제거) 이미지로 YOLO 분류 모델을 자동 학습 및 정확도 극대화
-#   3. 정밀 에지 밀도 검출: 자(Ruler)나 투명 물체 측정 시 주변 천장/손가락 노이즈를 차단하는 줌인 기능
 # ------------------------------------------------------------
 
 import argparse
@@ -70,48 +66,43 @@ CONTAMINATION_LABELS_KOR = {
 }
 
 # ============================================================
-# 핵심 기능: Git에 올라온 ZIP 파일 자동 압축해제 및 통합 학습 로직
+# 핵심 추가: Git/로컬 폴더 내 ZIP 파일 자동 압축해제 및 AI 학습 로직
 # ============================================================
 
 def auto_extract_and_train():
-    """레포지토리 내의 모든 ZIP 파일을 찾아 압축을 풀고 AI 모델을 자동 학습시킵니다."""
+    """레포지토리 내의 모든 한글명 ZIP 파일을 찾아 압축을 풀고 AI 모델을 자동 학습시킵니다."""
     zip_files = list(BASE_DIR.glob("*.zip"))
     if not zip_files:
         return
         
-    # 안내 팝업 및 진행 상황 표시 준비
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    status_text.info("📦 Git 레포지토리 내의 ZIP 데이터셋을 감지했습니다. 압축 해제 및 이미지 분류 중...")
+    status_text.info("📦 레포지토리 내부의 ZIP 데이터셋을 감지했습니다. 압축 해제 및 이미지 자동 정렬 중...")
     
-    # 품목(Material) 및 오염도(Contamination)용 학습 폴더 초기화 생성
+    # 데이터셋 저장 폴더 구조 생성
     for target in ["material", "contamination"]:
         for phase in ["train", "val"]:
             (DATASET_DIR / target / phase).mkdir(parents=True, exist_ok=True)
             
-    # 1. 발견된 모든 ZIP 파일 압축 해제 및 데이터 배치
+    # 1. 모든 ZIP 파일 압축 해제 후 클래스 분류 배치
     for idx, zip_path in enumerate(zip_files):
-        status_text.text(f"🔄 압축 해제 중: {zip_path.name} ({idx+1}/{len(zip_files)})")
-        
-        # 파일 이름 분석 (예: '종이_오염o.zip', '플라스틱_오염x.zip' 등)
+        status_text.text(f"🔄 압축 데이터 분석 중: {zip_path.name} ({idx+1}/{len(zip_files)})")
         name = zip_path.stem
         
-        # 한국어 파일명에 따른 클래스명 매핑 매칭
-        # 품목 매핑
+        # 파일명 기반 라벨 매핑
         m_class = "unknown"
         if "종이" in name: m_class = "paper"
         elif "플라스틱" in name: m_class = "plastic"
         elif "유리" in name: m_class = "glass"
         elif "비닐" in name: m_class = "vinyl"
         elif "캔" in name: m_class = "can"
+        elif "스티로폼" in name: m_class = "styrofoam"
         
-        # 오염도 매핑
         c_class = "uncertain"
         if "오염o" in name or "오염O" in name or "오염됨" in name: c_class = "dirty"
         elif "오염x" in name or "오염X" in name or "깨끗" in name: c_class = "clean"
         
-        # 임시 해제 구역
         temp_dir = BASE_DIR / f"temp_{name}"
         if temp_dir.exists(): shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -120,7 +111,7 @@ def auto_extract_and_train():
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
                 
-            # 임시 폴더 내의 이미지들을 8:2 비율로 train과 val로 나누어 목적지 폴더로 이동
+            # 압축 해제된 이미지 수집
             all_images = []
             for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
                 all_images.extend(list(temp_dir.rglob(ext)))
@@ -128,19 +119,18 @@ def auto_extract_and_train():
             random.seed(42)
             random.shuffle(all_images)
             
+            # 학습 데이터 80%, 검증 데이터 20% 분할
             split_idx = int(len(all_images) * 0.8)
             train_imgs = all_images[:split_idx]
             val_imgs = all_images[split_idx:]
             
-            # 파일 복사 함수 정의
             def copy_images(img_list, target_type, class_name, phase):
                 dest_dir = DATASET_DIR / target_type / phase / class_name
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 for img in img_list:
-                    # 파일명 충돌 방지를 위해 unique 고유 해시명 부여
+                    # 파일명 충돌을 방지하기 위해 유니크한 가시 이름 적용
                     shutil.copy(img, dest_dir / f"{zip_path.stem}_{img.name}")
                     
-            # 매핑이 유효할 경우 데이터셋 배치 작동
             if m_class != "unknown":
                 copy_images(train_imgs, "material", m_class, "train")
                 copy_images(val_imgs, "material", m_class, "val")
@@ -149,54 +139,56 @@ def auto_extract_and_train():
                 copy_images(val_imgs, "contamination", c_class, "val")
                 
         except Exception as e:
-            st.warning(f"⚠️ {zip_path.name} 처리 중 오류 발생: {e}")
+            st.warning(f"⚠️ {zip_path.name} 처리 오류: {e}")
         finally:
             if temp_dir.exists(): shutil.rmtree(temp_dir)
             
     progress_bar.progress(30)
-    
-    # 2. 통합 데이터셋 기반 YOLOv8 Classification 파인튜닝 시작
     MODELS_DIR.mkdir(exist_ok=True)
     
-    # [파트 A] 품목 분류 모델 학습
-    if (DATASET_DIR / "material" / "train").exists() and any((DATASET_DIR / "material" / "train").iterdir()):
-        status_text.text("🚀 [1/2] 품목 분류 AI 모델(Material) 파인튜닝 가동 중...")
-        model_m = YOLO(str(MATERIAL_MODEL_PATH)) if MATERIAL_MODEL_PATH.exists() else YOLO("yolov8n-cls.pt")
+    # 2. 품목 분류 AI 모델 학습 실행
+    mat_train_dir = DATASET_DIR / "material" / "train"
+    if mat_train_dir.exists() and any(mat_train_dir.iterdir()):
+        status_text.text("🚀 [1/2] 품목 분류 AI 모델(Material) 파인튜닝 학습 가동 중...")
+        model_m = YOLO("yolov8n-cls.pt")
         model_m.train(data=str(DATASET_DIR / "material"), epochs=10, imgsz=224, verbose=False)
         model_m.save(str(MATERIAL_MODEL_PATH))
         
-    progress_bar.progress(75)
+    progress_bar.progress(70)
     
-    # [파트 B] 오염도 판정 모델 학습
-    if (DATASET_DIR / "contamination" / "train").exists() and any((DATASET_DIR / "contamination" / "train").iterdir()):
-        status_text.text("🚀 [2/2] 오염도 판단 AI 모델(Contamination) 파인튜닝 가동 중...")
-        model_c = YOLO(str(CONTAMINATION_MODEL_PATH)) if CONTAMINATION_MODEL_PATH.exists() else YOLO("yolov8n-cls.pt")
+    # 3. 오염도 판정 AI 모델 학습 실행
+    cont_train_dir = DATASET_DIR / "contamination" / "train"
+    if cont_train_dir.exists() and any(cont_train_dir.iterdir()):
+        status_text.text("🚀 [2/2] 오염도 판정 AI 모델(Contamination) 파인튜닝 학습 가동 중...")
+        model_c = YOLO("yolov8n-cls.pt")
         model_c.train(data=str(DATASET_DIR / "contamination"), epochs=10, imgsz=224, verbose=False)
         model_c.save(str(CONTAMINATION_MODEL_PATH))
         
     progress_bar.progress(100)
-    status_text.success("🎉 모든 ZIP 파일 분석 및 AI 가중치 파인튜닝이 완료되었습니다! 서비스를 시작합니다.")
+    status_text.success("🎉 ZIP 파일 데이터셋 학습이 완료되었습니다! 정밀 탐지를 시작합니다.")
     time.sleep(2)
     status_text.empty()
     progress_bar.empty()
 
 # ============================================================
-# 정밀 에지 프로젝션 (손가락/배경 노이즈 무력화 기술)
+# 분석 영역 감지 로직 개선 (에지 투영 기반 타이트 크롭)
 # ============================================================
 
 def get_refined_bbox(image_bgr: np.ndarray) -> Tuple[int, int, int, int]:
     h, w = image_bgr.shape[:2]
     
-    # 중앙 집중 ROI 추출 (가장자리 전등/천장 노이즈 차단)
+    # 1. 가장자리 불필요한 배경(천장/손가락) 차단을 위한 중앙 집중 ROI
     cy, cx = h // 2, w // 2
     rh, rw = int(h * 0.75), int(w * 0.75)
     y1_r, x1_r = max(0, cy - rh // 2), max(0, cx - rw // 2)
     roi = image_bgr[y1_r:y1_r+rh, x1_r:x1_r+rw]
     
+    # 2. 가우시안 블러 및 Canny 에지 검출법 사용
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 40, 130)
     
+    # 3. 가로/세로 축 투영 데이터를 분석하여 윤곽선이 집중된 타이트 박스 계산
     x_counts = np.sum(edges > 0, axis=0)
     y_counts = np.sum(edges > 0, axis=1)
     
@@ -248,7 +240,7 @@ def draw_info_pil(image_bgr: np.ndarray, bbox: Tuple[int, int, int, int], label:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 # ============================================================
-# 메인 어플리케이션 구동부
+# 메인 구동 루프
 # ============================================================
 
 def predict(model, img_bgr):
@@ -263,7 +255,7 @@ def main():
     st.set_page_config(page_title="스마트 재활용 분류 시스템 v12", layout="wide")
     st.title("♻️ 스마트 재활용 분류 시스템 v12")
     
-    # 최초 구동 시 단 한 번만 로컬 데이터셋 자동 빌드 및 AI 학습 프로세스 트리거
+    # 런타임 시작 시 단 한 번 자동 추출 및 파인튜닝 가동
     if "trained" not in st.session_state:
         auto_extract_and_train()
         st.session_state.trained = True
@@ -277,7 +269,7 @@ def main():
     m_model, c_model = load_models()
     
     if m_model is None:
-        st.warning("⚠️ 학습 데이터가 없거나 모델 파일이 생성되지 않았습니다. 메인 폴더에 한글 이름 정보가 담긴 ZIP 파일을 업로드해 주세요.")
+        st.warning("⚠️ 메인 디렉토리에 학습용 ZIP 파일을 넣어두시면 자동으로 압축 해제 및 학습이 완수됩니다.")
         
     if "result" not in st.session_state:
         st.session_state.result = None
@@ -288,21 +280,21 @@ def main():
         tab1, tab2 = st.tabs(["📁 이미지 분석", "📷 카메라 촬영"])
         img_input = None
         with tab1:
-            uploaded = st.file_uploader("재활용 쓰레기 사진을 올려주세요", type=["jpg", "png", "jpeg"])
+            uploaded = st.file_uploader("사진을 선택해 주세요", type=["jpg", "png", "jpeg"])
             if uploaded:
                 img_input = Image.open(uploaded)
                 st.image(img_input, use_container_width=True)
                 if st.button("🔍 분류 분석 시작", key="up_btn"):
                     st.session_state.btn_trigger = True
         with tab2:
-            camera = st.camera_input("카메라에 물체가 꽉 차도록 대어주세요")
+            camera = st.camera_input("카메라에 물체를 가깝게 비춰주세요")
             if camera:
                 img_input = Image.open(camera)
                 if st.button("🔍 분류 분석 시작", key="cam_btn"):
                     st.session_state.btn_trigger = True
 
     if img_input and st.session_state.get("btn_trigger"):
-        with st.spinner("에지 기반 타이트 크롭 및 인공지능 분류 중..."):
+        with st.spinner("AI 분석 작동 중..."):
             img_np = np.array(img_input)
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
             
@@ -333,12 +325,12 @@ def main():
             c2.metric("위생 상태", c_kor, f"{res['c_conf']*100:.1f}%")
             
             if res["c_label"] == "dirty":
-                st.warning(f"⚠️ **{m_kor}** 내부에 잔여물이 있거나 오염 상태입니다. 물에 깨끗이 씻어서 배출해 주세요.")
+                st.warning(f"⚠️ **{m_kor}** 내부에 오염이 감지되었습니다. 물에 씻어서 배출하세요.")
             else:
-                st.success(f"✅ 오염되지 않은 깨끗한 **{m_kor}**입니다. 정상 분리수거가 가능합니다.")
+                st.success(f"✅ 상태가 깨끗한 **{m_kor}**입니다. 정상 수거함에 분리배출 하세요.")
             
             viz = draw_info_pil(res["img_bgr"], res["bbox"], m_kor)
-            st.image(cv2.cvtColor(viz, cv2.COLOR_BGR2RGB), caption="물체 포커싱 추적 영역(BBox)", use_container_width=True)
+            st.image(cv2.cvtColor(viz, cv2.COLOR_BGR2RGB), caption="시스템 인식 범위(BBox)", use_container_width=True)
 
 if __name__ == "__main__":
     main()
